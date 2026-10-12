@@ -3824,6 +3824,13 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
     if (Ctype != GGML_TYPE_F32)
         return false;
 
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+    // i8mm CPUs: quantized types are faster through their mmla vec_dot kernels;
+    // keep the tiled path for the float types only.
+    if (Atype != GGML_TYPE_F32 && Atype != GGML_TYPE_F16 && Atype != GGML_TYPE_BF16)
+        return false;
+#endif
+
     switch (Atype) {
 
     case GGML_TYPE_F32: {

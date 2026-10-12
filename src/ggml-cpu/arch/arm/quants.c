@@ -131,8 +131,48 @@ void quantize_row_q8_1(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, i
 }
 
 // placeholder implementation for Apple targets
-void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
-    quantize_row_q8_K_ref(x, y, k);
+void quantize_row_q8_K(const float * GGML_RESTRICT x, void * GGML_RESTRICT vy, int64_t k) {
+#if defined(__ARM_NEON) && defined(__aarch64__)
+    // Same result as quantize_row_q8_K_ref: scale from the first element with the
+    // largest |x|, one fp32 multiply, round-to-nearest-even (vcvtnq == nearest_int).
+    assert(k % QK_K == 0);
+    block_q8_K * GGML_RESTRICT y = vy;
+    const int64_t nb = k / QK_K;
+
+    for (int64_t i = 0; i < nb; i++, x += QK_K) {
+        float32x4_t vmax = vdupq_n_f32(0.0f);
+        for (int j = 0; j < QK_K; j += 4) {
+            vmax = vmaxq_f32(vmax, vabsq_f32(vld1q_f32(x + j)));
+        }
+        const float amax = vmaxvq_f32(vmax);
+        if (!amax) {
+            y[i].d = 0;
+            memset(y[i].qs, 0, QK_K);
+            memset(y[i].bsums, 0, sizeof(y[i].bsums));
+            continue;
+        }
+        float max = amax;
+        for (int j = 0; j < QK_K; ++j) {
+            if (fabsf(x[j]) == amax) { max = x[j]; break; }
+        }
+        const float iscale = -127.f/max;
+        const float32x4_t vis = vdupq_n_f32(iscale);
+        for (int j = 0; j < QK_K; j += 16) {
+            const int32x4_t a0 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(x + j +  0), vis));
+            const int32x4_t a1 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(x + j +  4), vis));
+            const int32x4_t a2 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(x + j +  8), vis));
+            const int32x4_t a3 = vcvtnq_s32_f32(vmulq_f32(vld1q_f32(x + j + 12), vis));
+            const int16x8_t h0 = vcombine_s16(vqmovn_s32(a0), vqmovn_s32(a1));
+            const int16x8_t h1 = vcombine_s16(vqmovn_s32(a2), vqmovn_s32(a3));
+            const int8x16_t q  = vcombine_s8(vqmovn_s16(h0), vqmovn_s16(h1));
+            vst1q_s8(y[i].qs + j, vminq_s8(q, vdupq_n_s8(127)));
+            y[i].bsums[j/16] = (int16_t) vaddlvq_s8(vminq_s8(q, vdupq_n_s8(127)));
+        }
+        y[i].d = 1/iscale;
+    }
+#else
+    quantize_row_q8_K_ref(x, vy, k);
+#endif
 }
 
 //===================================== Dot products =================================
@@ -1572,16 +1612,162 @@ void ggml_vec_dot_tq1_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 }
 
 void ggml_vec_dot_tq2_0_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
-    assert(nrc == 1);
-    UNUSED(nrc);
-    UNUSED(bx);
-    UNUSED(by);
-    UNUSED(bs);
+    assert(nrc == 1 || nrc == 2 || nrc == 4);
 
     const block_tq2_0 * GGML_RESTRICT x = vx;
     const block_q8_K  * GGML_RESTRICT y = vy;
 
     const int nb = n / QK_K;
+
+#if defined(__ARM_FEATURE_DOTPROD)
+    // 4x4 tile: four weight rows x four activation columns per call; each unpacked
+    // weight vector feeds four dot products and each activation vector four more.
+    // s[r + c*bs] = dot(row r, col c)
+    if (nrc == 4) {
+        const block_tq2_0 * GGML_RESTRICT xr[4];
+        const block_q8_K  * GGML_RESTRICT yc[4];
+        for (int k = 0; k < 4; ++k) {
+            xr[k] = (const block_tq2_0 *) ((const char *) vx + k*bx);
+            yc[k] = (const block_q8_K  *) ((const char *) vy + k*by);
+        }
+
+        const uint8x16_t m3 = vdupq_n_u8(3);
+        float32x4_t acc[4] = { vdupq_n_f32(0.0f), vdupq_n_f32(0.0f), vdupq_n_f32(0.0f), vdupq_n_f32(0.0f) };
+
+        for (int i = 0; i < nb; ++i) {
+            int32x4_t sm[4][4]; // [row][col]
+            for (int r = 0; r < 4; ++r) for (int c = 0; c < 4; ++c) sm[r][c] = vdupq_n_s32(0);
+
+            for (int j = 0; j < (int) sizeof(x->qs); j += 32) {
+                for (int h = 0; h < 32; h += 16) {
+                    const uint8x16_t q0 = vld1q_u8(xr[0][i].qs + j + h);
+                    const uint8x16_t q1 = vld1q_u8(xr[1][i].qs + j + h);
+                    const uint8x16_t q2 = vld1q_u8(xr[2][i].qs + j + h);
+                    const uint8x16_t q3 = vld1q_u8(xr[3][i].qs + j + h);
+#define TQ2_4X4_STEP(K, SH)                                                          \
+                    {                                                                \
+                        const int8x16_t w0 = vreinterpretq_s8_u8(vandq_u8(SH(q0), m3)); \
+                        const int8x16_t w1 = vreinterpretq_s8_u8(vandq_u8(SH(q1), m3)); \
+                        const int8x16_t w2 = vreinterpretq_s8_u8(vandq_u8(SH(q2), m3)); \
+                        const int8x16_t w3 = vreinterpretq_s8_u8(vandq_u8(SH(q3), m3)); \
+                        for (int c = 0; c < 4; ++c) {                                \
+                            const int8x16_t a = vld1q_s8(yc[c][i].qs + j*4 + 32*(K) + h); \
+                            sm[0][c] = vdotq_s32(sm[0][c], w0, a);                   \
+                            sm[1][c] = vdotq_s32(sm[1][c], w1, a);                   \
+                            sm[2][c] = vdotq_s32(sm[2][c], w2, a);                   \
+                            sm[3][c] = vdotq_s32(sm[3][c], w3, a);                   \
+                        }                                                            \
+                    }
+#define TQ2_SH0(v) (v)
+#define TQ2_SH2(v) vshrq_n_u8(v, 2)
+#define TQ2_SH4(v) vshrq_n_u8(v, 4)
+#define TQ2_SH6(v) vshrq_n_u8(v, 6)
+                    TQ2_4X4_STEP(0, TQ2_SH0)
+                    TQ2_4X4_STEP(1, TQ2_SH2)
+                    TQ2_4X4_STEP(2, TQ2_SH4)
+                    TQ2_4X4_STEP(3, TQ2_SH6)
+#undef TQ2_4X4_STEP
+#undef TQ2_SH0
+#undef TQ2_SH2
+#undef TQ2_SH4
+#undef TQ2_SH6
+                }
+            }
+
+            const float xd[4] = {
+                GGML_CPU_FP16_TO_FP32(xr[0][i].d), GGML_CPU_FP16_TO_FP32(xr[1][i].d),
+                GGML_CPU_FP16_TO_FP32(xr[2][i].d), GGML_CPU_FP16_TO_FP32(xr[3][i].d),
+            };
+            const float32x4_t vxd = vld1q_f32(xd);
+
+            for (int c = 0; c < 4; ++c) {
+                // horizontal sums of the 4 rows for column c -> {r0, r1, r2, r3}
+                const int32x4_t rows = vpaddq_s32(vpaddq_s32(sm[0][c], sm[1][c]), vpaddq_s32(sm[2][c], sm[3][c]));
+                // codes are {0,1,2} = w+1, so subtract sum(y) of this column from every row
+                const int32_t ys = vaddlvq_s16(vaddq_s16(vld1q_s16(yc[c][i].bsums), vld1q_s16(yc[c][i].bsums + 8)));
+                const int32x4_t si = vsubq_s32(rows, vdupq_n_s32(ys));
+                acc[c] = vmlaq_f32(acc[c], vcvtq_f32_s32(si), vmulq_n_f32(vxd, yc[c][i].d));
+            }
+        }
+
+        for (int c = 0; c < 4; ++c) {
+            vst1q_f32(s + c*bs, acc[c]);
+        }
+        return;
+    }
+
+    // 2x2 tile: two weight rows x two activation columns per call, so each unpacked
+    // weight vector and each loaded activation vector feeds two dot products.
+    // s[r + c*bs] = dot(row r, col c)
+    if (nrc == 2) {
+        const block_tq2_0 * GGML_RESTRICT x0 = x;
+        const block_tq2_0 * GGML_RESTRICT x1 = (const block_tq2_0 *) ((const char *) vx + bx);
+        const block_q8_K  * GGML_RESTRICT y0 = y;
+        const block_q8_K  * GGML_RESTRICT y1 = (const block_q8_K *) ((const char *) vy + by);
+
+        const uint8x16_t m3 = vdupq_n_u8(3);
+        float32x4_t acc = vdupq_n_f32(0.0f); // {r0c0, r1c0, r0c1, r1c1}
+
+        for (int i = 0; i < nb; ++i) {
+            int32x4_t s00 = vdupq_n_s32(0), s10 = vdupq_n_s32(0);
+            int32x4_t s01 = vdupq_n_s32(0), s11 = vdupq_n_s32(0);
+
+            for (int j = 0; j < (int) sizeof(x->qs); j += 32) {
+                for (int h = 0; h < 32; h += 16) {
+                    const uint8x16_t a = vld1q_u8(x0[i].qs + j + h);
+                    const uint8x16_t b = vld1q_u8(x1[i].qs + j + h);
+#define TQ2_2X2_STEP(K, SH)                                                              \
+                    {                                                                    \
+                        const int8x16_t wa = vreinterpretq_s8_u8(vandq_u8(SH(a), m3));   \
+                        const int8x16_t wb = vreinterpretq_s8_u8(vandq_u8(SH(b), m3));   \
+                        const int8x16_t c0 = vld1q_s8(y0[i].qs + j*4 + 32*(K) + h);      \
+                        const int8x16_t c1 = vld1q_s8(y1[i].qs + j*4 + 32*(K) + h);      \
+                        s00 = vdotq_s32(s00, wa, c0);                                    \
+                        s10 = vdotq_s32(s10, wb, c0);                                    \
+                        s01 = vdotq_s32(s01, wa, c1);                                    \
+                        s11 = vdotq_s32(s11, wb, c1);                                    \
+                    }
+#define TQ2_SH0(v) (v)
+#define TQ2_SH2(v) vshrq_n_u8(v, 2)
+#define TQ2_SH4(v) vshrq_n_u8(v, 4)
+#define TQ2_SH6(v) vshrq_n_u8(v, 6)
+                    TQ2_2X2_STEP(0, TQ2_SH0)
+                    TQ2_2X2_STEP(1, TQ2_SH2)
+                    TQ2_2X2_STEP(2, TQ2_SH4)
+                    TQ2_2X2_STEP(3, TQ2_SH6)
+#undef TQ2_2X2_STEP
+#undef TQ2_SH0
+#undef TQ2_SH2
+#undef TQ2_SH4
+#undef TQ2_SH6
+                }
+            }
+
+            // codes are {0,1,2} = w+1, so subtract sum(y) once per column
+            const int32_t ys0 = vaddlvq_s16(vaddq_s16(vld1q_s16(y0[i].bsums), vld1q_s16(y0[i].bsums + 8)));
+            const int32_t ys1 = vaddlvq_s16(vaddq_s16(vld1q_s16(y1[i].bsums), vld1q_s16(y1[i].bsums + 8)));
+
+            const int32_t si[4] = {
+                vaddvq_s32(s00) - ys0, vaddvq_s32(s10) - ys0,
+                vaddvq_s32(s01) - ys1, vaddvq_s32(s11) - ys1,
+            };
+            const float xd0 = GGML_CPU_FP16_TO_FP32(x0[i].d), xd1 = GGML_CPU_FP16_TO_FP32(x1[i].d);
+            const float dd[4] = { xd0 * y0[i].d, xd1 * y0[i].d, xd0 * y1[i].d, xd1 * y1[i].d };
+
+            acc = vmlaq_f32(acc, vcvtq_f32_s32(vld1q_s32(si)), vld1q_f32(dd));
+        }
+
+        s[0]      = vgetq_lane_f32(acc, 0);
+        s[1]      = vgetq_lane_f32(acc, 1);
+        s[bs]     = vgetq_lane_f32(acc, 2);
+        s[bs + 1] = vgetq_lane_f32(acc, 3);
+        return;
+    }
+#endif
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
 
 #if defined(__ARM_NEON)
     float sumf = 0.0f;

@@ -43,13 +43,18 @@
 #include <omp.h>
 #endif
 
-#if defined(__ARM_FEATURE_SVE) || defined(__ARM_FEATURE_MATMUL_INT8)
+#if defined(__ARM_FEATURE_SVE)
 #undef GGML_USE_LLAMAFILE
 #endif
 
 #ifdef GGML_USE_LLAMAFILE
 #include "llamafile/sgemm.h"
 #endif
+
+#if defined(GGML_USE_ACCELERATE)
+#include <Accelerate/Accelerate.h>
+#endif
+
 
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
 #    include "spacemit/ime.h"
@@ -408,7 +413,11 @@ static const struct ggml_type_traits_cpu type_traits_cpu[GGML_TYPE_COUNT] = {
         .from_float               = quantize_row_tq2_0,
         .vec_dot                  = ggml_vec_dot_tq2_0_q8_K,
         .vec_dot_type             = GGML_TYPE_Q8_K,
+#if defined(__ARM_FEATURE_DOTPROD)
+        .nrows                    = 4,
+#else
         .nrows                    = 1,
+#endif
     },
     [GGML_TYPE_I32] = {
         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_i32,
@@ -1206,15 +1215,23 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     const size_t src1_col_stride = src1_cont || src1->type != vec_dot_type ? row_size : nb11;
 
     // attempt to reduce false-sharing (does not seem to make a difference)
-    // 16 * 2, accounting for mmla kernels
-    float tmp[32];
+    // 16 * 4, accounting for multi-row/col kernels (up to 4x4 tiles)
+    float tmp[64];
 
     for (int64_t iir1 = ir1_start; iir1 < ir1_end; iir1 += blck_1) {
         for (int64_t iir0 = ir0_start; iir0 < ir0_end; iir0 += blck_0) {
-            for (int64_t ir1 = iir1; ir1 < iir1 + blck_1 && ir1 < ir1_end; ir1 += num_rows_per_vec_dot) {
+            const int64_t ir1_lim = MIN(iir1 + blck_1, ir1_end);
+            const int64_t ir0_lim = MIN(iir0 + blck_0, ir0_end);
+            for (int64_t ir1 = iir1; ir1 < ir1_lim; ) {
                 const int64_t i13 = (ir1 / (ne12 * ne1));
                 const int64_t i12 = (ir1 - i13 * ne12 * ne1) / ne1;
                 const int64_t i11 = (ir1 - i13 * ne12 * ne1 - i12 * ne1);
+
+                // a column tile must not run past the block/chunk or cross a dim1 boundary; else do one column
+                int64_t nc = num_rows_per_vec_dot;
+                if (nc > 1 && (ir1 + nc > ir1_lim || i11 + nc > ne11)) {
+                    nc = 1;
+                }
 
                 // broadcast src0 into src1
                 const int64_t i03 = i13 / r3;
@@ -1236,17 +1253,24 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                         : (i11 * nb11 + i12 * nb12 + i13 * nb13));
                 float * dst_col = (float*)((char*)dst->data + (i1 * nb1 + i2 * nb2 + i3 * nb3));
 
-                //for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
-                //    vec_dot(ne00, &dst_col[ir0], src0_row + ir0*nb01, src1_col);
-                //}
-
-                for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
-                    vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
+                for (int64_t ir0 = iir0; ir0 < ir0_lim; ) {
+                    if (nc > 1 && ir0 + nc <= ir0_lim) {
+                        vec_dot(ne00, &tmp[ir0 - iir0], 16, src0_row + ir0 * nb01, nb01, src1_col, src1_col_stride, nc);
+                        ir0 += nc;
+                    } else {
+                        // row tail (or single-column tile): one row against each column
+                        for (int64_t cn = 0; cn < nc; ++cn) {
+                            vec_dot(ne00, &tmp[ir0 - iir0 + cn * 16], 0, src0_row + ir0 * nb01, 0, src1_col + cn * src1_col_stride, 0, 1);
+                        }
+                        ir0 += 1;
+                    }
                 }
 
-                for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
-                    memcpy(&dst_col[iir0 + cn * nb1 / nb0], tmp + (cn * 16), (MIN(iir0 + blck_0, ir0_end) - iir0) * sizeof(float));
+                for (int64_t cn = 0; cn < nc; ++cn) {
+                    memcpy(&dst_col[iir0 + cn * nb1 / nb0], tmp + (cn * 16), (ir0_lim - iir0) * sizeof(float));
                 }
+
+                ir1 += nc;
             }
         }
     }
@@ -1288,6 +1312,52 @@ void ggml_compute_forward_mul_mat(
     GGML_ASSERT(nb00 == ggml_type_size(src0->type));
     GGML_ASSERT(nb10 == ggml_type_size(src1->type));
 
+#if defined(GGML_USE_ACCELERATE)
+    // Apple platforms: F32 x F32 through Accelerate (AMX). Work is split across the
+    // ggml threads: by (i12,i13) plane when there are enough planes (attention heads),
+    // otherwise by blocks of src0 rows. GGML_ACCEL_F32=0 disables (A/B).
+    {
+        static int accel_on = -1;
+        if (accel_on < 0) {
+            const char * e = getenv("GGML_ACCEL_F32");
+            accel_on = !(e && e[0] == '0');
+            // ggml already splits the work across its threads; keep Accelerate's own
+            // pool out of the way so the two don't oversubscribe the cores.
+            if (accel_on && nth > 1) {
+                if (__builtin_available(macOS 15.0, iOS 18.0, tvOS 18.0, watchOS 11.0, *)) {
+                    BLASSetThreading(BLAS_THREADING_SINGLE_THREADED);
+                }
+            }
+        }
+        if (accel_on && src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+            nb0 == sizeof(float) && ne03 == ne13 && ne02 == ne12) {
+            const int64_t nplanes = ne12 * ne13;
+            const bool    by_plane = nplanes >= nth;
+            const int64_t rows_per = by_plane ? ne01 : (ne01 + nth - 1) / nth;
+            const int64_t r0 = by_plane ? 0 : MIN(ne01, ith * rows_per);
+            const int64_t r1 = by_plane ? ne01 : MIN(ne01, r0 + rows_per);
+            for (int64_t ip = by_plane ? ith : 0; ip < nplanes; ip += by_plane ? nth : 1) {
+                if (r1 <= r0) break;
+                const int64_t i12 = ip % ne12, i13 = ip / ne12;
+                const float * A = (const float *) ((const char *) src0->data + i12 * nb02 + i13 * nb03 + r0 * nb01);
+                const float * B = (const float *) ((const char *) src1->data + i12 * nb12 + i13 * nb13);
+                float *       C = (float *) ((char *) dst->data + i12 * nb2 + i13 * nb3) + r0;
+                const int     m = (int) (r1 - r0);
+                if (ne11 == 1) {
+                    cblas_sgemv(CblasRowMajor, CblasNoTrans, m, (int) ne00, 1.0f,
+                                A, (int) (nb01 / sizeof(float)), B, 1, 0.0f, C, 1);
+                } else {
+                    // C[ne11 x m] = B[ne11 x ne00] * A[m x ne00]^T
+                    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, (int) ne11, m, (int) ne00, 1.0f,
+                                B, (int) (nb11 / sizeof(float)), A, (int) (nb01 / sizeof(float)), 0.0f,
+                                C, (int) (nb1 / sizeof(float)));
+                }
+            }
+            return;
+        }
+    }
+#endif
+
     // dst cannot be transposed or permuted
     GGML_ASSERT(nb0 == sizeof(float));
     GGML_ASSERT(nb0 <= nb1);
@@ -1305,17 +1375,87 @@ void ggml_compute_forward_mul_mat(
 
     const bool src1_cont = ggml_is_contiguous(src1);
 
+    /* rfdetr.cpp patch: merge per-broadcast llamafile_sgemm calls when src0
+     * is unbroadcasted along a dim and src1/dst pack that dim contiguously.
+     *
+     * Why: ggml's mul_mat broadcasts over ne12/ne13 by issuing one sgemm per
+     * (i12,i13) pair. For e.g. windowed attention (ne12=16 windows, ne11=101
+     * tokens) that's 16 sgemm calls of N=101 instead of one call of N=1616.
+     * Per-call overhead (ggml_barrier, chunk setup, kernel prelude) and poor
+     * thread utilization on small N strictly dominate the actual FMA work.
+     * Folding the 16 windows into a single N=1616 call gives 4-5x speedup on
+     * those shapes (see git log for measurements). */
     if (src1_cont) {
+        const size_t ts_src0 = ggml_type_size(src0->type);
+        const size_t ts_src1 = ggml_type_size(src1->type);
+        const size_t ts_dst  = ggml_type_size(dst->type);
+
+        /* dst must be row-contiguous along the dims we want to fold. */
+        const bool dst_pack_2 = (nb1 == ts_dst * ne0)  && (nb2 == nb1 * ne1);
+        const bool dst_pack_3 = dst_pack_2             && (nb3 == nb2 * ne2);
+
+        /* src1 must pack the dim we're folding. For src1_cont, nb12 =
+         * nb11*ne11 and nb13 = nb12*ne12, so:
+         *   - dim 2 always packs (stride = ne11 rows)
+         *   - dim 3 packs across BOTH 12 and 13 only if ne12==1 OR we fold
+         *     both 12 and 13 together. */
+        const bool src1_pack_2 = (nb12 == nb11 * ne11);
+
+        /* src0 must NOT change as we step through the dim, i.e. ne0X == 1
+         * (purely broadcasted), so all (i12, i13) read the same weight page. */
+        const bool src0_share_2 = (ne02 == 1);
+        const bool src0_share_3 = (ne03 == 1);
+
+        /* fold_2_3: collapse both ne12 and ne13 into a flat N. Requires src0
+         * to be broadcast on BOTH dims; src1 to be fully packed (it is, when
+         * src1_cont). */
+        const bool fold_2_3 = src0_share_2 && src0_share_3 && src1_pack_2 &&
+                              dst_pack_3 && (ne12 * ne13 > 1);
+
+        /* fold_2: per-i13 sgemm collapsing ne12 into N. Used when ne03 > 1
+         * but ne02 == 1. */
+        const bool fold_2_only = !fold_2_3 && src0_share_2 && src1_pack_2 &&
+                                 dst_pack_2 && ne12 > 1;
+
+        if (fold_2_3) {
+            /* Single sgemm: collapse both broadcast dims into a flat N. */
+            if (!llamafile_sgemm(params,
+                                 ne01, ne11 * ne12 * ne13, ne00/ggml_blck_size(src0->type),
+                                 (const char *)src0->data,
+                                 nb01/ts_src0,
+                                 (const char *)src1->data,
+                                 nb11/ts_src1,
+                                 (char *)dst->data,
+                                 nb1/ts_dst,
+                                 src0->type, src1->type, dst->type))
+                goto UseGgmlGemm1;
+            return;
+        }
+        if (fold_2_only) {
+            for (int64_t i13 = 0; i13 < ne13; i13++)
+                if (!llamafile_sgemm(params,
+                                     ne01, ne11 * ne12, ne00/ggml_blck_size(src0->type),
+                                     (const char *)src0->data + i13/r3*nb03,
+                                     nb01/ts_src0,
+                                     (const char *)src1->data + i13*nb13,
+                                     nb11/ts_src1,
+                                     (char *)dst->data + i13*nb3,
+                                     nb1/ts_dst,
+                                     src0->type, src1->type, dst->type))
+                    goto UseGgmlGemm1;
+            return;
+        }
+
         for (int64_t i13 = 0; i13 < ne13; i13++)
             for (int64_t i12 = 0; i12 < ne12; i12++)
                 if (!llamafile_sgemm(params,
                                      ne01, ne11, ne00/ggml_blck_size(src0->type),
                                      (const char *)src0->data + i12/r2*nb02 + i13/r3*nb03,
-                                     nb01/ggml_type_size(src0->type),
+                                     nb01/ts_src0,
                                      (const char *)src1->data + i12*nb12 + i13*nb13,
-                                     nb11/ggml_type_size(src1->type),
+                                     nb11/ts_src1,
                                      (char *)dst->data + i12*nb2 + i13*nb3,
-                                     nb1/ggml_type_size(dst->type),
+                                     nb1/ts_dst,
                                      src0->type,
                                      src1->type,
                                      dst->type))
@@ -1381,17 +1521,65 @@ UseGgmlGemm1:;
     if (src1->type != vec_dot_type) {
         const void* wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
+        const size_t ts_src0 = ggml_type_size(src0->type);
+        const size_t ts_vdt  = ggml_type_size(vec_dot_type);
+        const size_t ts_dst  = ggml_type_size(dst->type);
+
+        /* Same broadcast-fold as the F32 path above. wdata layout from
+         * the from_float loop iterates (i13, i12, i11) outer→inner, so the
+         * memory order is i13-outermost: offset(i12, i13) =
+         *   (i12*ne11 + i13*ne12*ne11)*row_size
+         * Stride between consecutive i12 (i13 fixed): ne11*row_size  -> packs dim 2
+         * Stride between consecutive i13 (i12 fixed): ne12*ne11*row_size -> NOT packed
+         *   (those rows are interleaved with other heads). fold_3 is therefore
+         *   only safe in the no-wdata path above. */
+        const bool dst_pack_2  = (nb1 == ts_dst * ne0)  && (nb2 == nb1 * ne1);
+        const bool dst_pack_3  = dst_pack_2             && (nb3 == nb2 * ne2);
+        const bool src0_share_2 = (ne02 == 1);
+        const bool src0_share_3 = (ne03 == 1);
+
+        const bool fold_2_3 = src0_share_2 && src0_share_3 && dst_pack_3 &&
+                              (ne12 * ne13 > 1);
+        const bool fold_2   = src0_share_2 && dst_pack_2 && ne12 > 1;
+
+        if (fold_2_3) {
+            if (!llamafile_sgemm(params,
+                                 ne01, ne11 * ne12 * ne13, ne00/ggml_blck_size(src0->type),
+                                 (const char *)src0->data,
+                                 nb01/ts_src0,
+                                 (const char *)wdata,
+                                 row_size/ts_vdt,
+                                 (char *)dst->data,
+                                 nb1/ts_dst,
+                                 src0->type, vec_dot_type, dst->type))
+                goto UseGgmlGemm2;
+            return;
+        }
+        if (fold_2) {
+            for (int64_t i13 = 0; i13 < ne13; i13++)
+                if (!llamafile_sgemm(params,
+                                     ne01, ne11 * ne12, ne00/ggml_blck_size(src0->type),
+                                     (const char *)src0->data + i13/r3*nb03,
+                                     nb01/ts_src0,
+                                     (const char *)wdata + i13*ne12*ne11*row_size,
+                                     row_size/ts_vdt,
+                                     (char *)dst->data + i13*nb3,
+                                     nb1/ts_dst,
+                                     src0->type, vec_dot_type, dst->type))
+                    goto UseGgmlGemm2;
+            return;
+        }
 
         for (int64_t i13 = 0; i13 < ne13; i13++)
             for (int64_t i12 = 0; i12 < ne12; i12++)
                 if (!llamafile_sgemm(params,
                                      ne01, ne11, ne00/ggml_blck_size(src0->type),
                                      (const char *)src0->data + i12/r2*nb02 + i13/r3*nb03,
-                                     nb01/ggml_type_size(src0->type),
+                                     nb01/ts_src0,
                                      (const char *)wdata + (i12*ne11 + i13*ne12*ne11)*row_size,
-                                     row_size/ggml_type_size(vec_dot_type),
+                                     row_size/ts_vdt,
                                      (char *)dst->data + i12*nb2 + i13*nb3,
-                                     nb1/ggml_type_size(dst->type),
+                                     nb1/ts_dst,
                                      src0->type,
                                      vec_dot_type,
                                      dst->type))
@@ -1452,9 +1640,7 @@ UseGgmlGemm2:;
 
         // these checks are needed to avoid crossing dim1 boundaries
         // can be optimized, but the logic would become more complicated, so keeping it like this for simplicity
-        if ((nr0 % 2 != 0) || (ne11 % 2 != 0) || ((ir0_end - ir0_start) % 2 != 0) || ((ir1_end - ir1_start) % 2 != 0)) {
-            num_rows_per_vec_dot = 1;
-        }
+        // partial tiles are handled inside the chunk loop, one row/column at a time
         ggml_compute_forward_mul_mat_one_chunk(params, dst, src0->type, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
 
         if (nth >= nchunk0 * nchunk1) {
@@ -3091,6 +3277,7 @@ static int ggml_cpu_try_fuse_ops(
 
     return 0;
 }
+
 
 static thread_ret_t ggml_graph_compute_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
